@@ -1,6 +1,6 @@
 # Colony Manager
 
-A mouse colony manager that runs entirely in your browser. Open it here:
+Local colony manager that can be run in your browser. Open it here:
 
 **https://muffinburgh.github.io/colony-manager/**
 
