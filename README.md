@@ -2,7 +2,7 @@
 
 Local colony manager that can be run in your browser. Open it here:
 
-**https://muffinburgh.github.io/colony-manager/](https://muffinburgh.github.io/Colony-Manager/**
+**https://muffinburgh.github.io/Colony-Manager/**
 
 ## Building
 
