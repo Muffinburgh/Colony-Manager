@@ -210,6 +210,8 @@ function takenMouseNames() { return new Set(DB.mice.map(m => m.name)); }
 const piLine = () => [DB.settings.pi && 'PI ' + DB.settings.pi, DB.settings.protocol && 'Protocol ' + DB.settings.protocol].filter(Boolean).join(' · ');
 
 /* Barcode check: G-C-0000XXXXXXX = series base + cage number. */
+/* Only a hint: some printings don't follow base + cage number, so a mismatch never blocks anything. */
+const BARCODE_HINT = '. Some printings don\'t follow the base + cage number pattern, so this is only a hint.';
 function checkBarcode(barcode, cageName) {
   const digits = String(barcode || '').replace(/\D/g, '');
   if (!digits || !(DB.settings.series || []).length) return null;

@@ -124,6 +124,32 @@ function noteStrain(plan, raw, where) {
   if (r.name && !r.known) { if (!plan.newStrains.has(r.name)) plan.newStrains.set(r.name, { name: r.name, where: [], add: true }); plan.newStrains.get(r.name).where.push(where); }
   return r;
 }
+const bcDigits = b => String(b || '').replace(/\D/g, '').replace(/^0+/, '');
+/** True for 470 and 470-B, 470-C… */
+const sameNumber = (a, b) => lc(a).replace(/-[b-z]$/, '') === lc(b).replace(/-[b-z]$/, '');
+/** Next unused lettered name for a cage number: 470 → 470-B, 470-C… */
+function nextFreeCageName(plan, name) {
+  const base = name.replace(/-[B-Z]$/i, '');
+  const L = [...'BCDEFGHIJKLMNOPQRSTUVWXYZ'].find(L => !cageNamed(`${base}-${L}`) && !plan.cages.some(c => c.key === lc(`${base}-${L}`)));
+  return L ? `${base}-${L}` : `${base}-${Date.now() % 1000}`;
+}
+/** Which cage a file cage is. A barcode already in the app or file means that cage. A cage number already used by a cage
+ *  with a different barcode is a different cage, added under the next free letter (470 → 470-B). Returns the name to use. */
+function resolveCageName(plan, data, iss) {
+  const bc = bcDigits(data.barcode), name = data.name;
+  if (bc) {
+    const byBc = DB.cages.find(c => bcDigits(c.barcode) === bc);
+    if (byBc) { if (lc(byBc.name) !== lc(name)) iss.push(issue(sameNumber(byBc.name, name) ? 'info' : 'warn', `Barcode belongs to cage ${byBc.name} in the app: treated as that cage`)); return byBc.name; }
+    const inFile = plan.cages.find(c => bcDigits(c.data.barcode) === bc);
+    if (inFile) return inFile.data.name;
+  }
+  const users = n => [cageNamed(n), ...plan.cages.filter(c => c.key === lc(n)).map(c => c.data)].filter(Boolean);
+  const other = users(name).find(c => bc && bcDigits(c.barcode) && bcDigits(c.barcode) !== bc);
+  if (!other) return name;
+  const n = nextFreeCageName(plan, name);
+  iss.push(issue('warn', `Cage number ${name} is already used by a cage with barcode ${other.barcode}: added as ${n}. Rename it on the cage page if you prefer.`));
+  return n;
+}
 function addCagePlan(plan, data, issues, src) {
   const ex = cageNamed(data.name);
   const p = { key: lc(data.name), data, issues: issues || [], include: true, existing: ex || null, src };
@@ -147,15 +173,32 @@ function planFromCards(src) {
   const pendingNames = [];
   src.cards.forEach((card, ci) => {
     const where = card.photo || `card ${ci + 1}`;
-    const name = norm(card.cage_number);
+    const sig = JSON.stringify({ ...card, photo: undefined });
+    const copyOf = src.cards.findIndex((c, j) => j < ci && JSON.stringify({ ...c, photo: undefined }) === sig);
+    if (copyOf >= 0) { plan.notes.push(issue('info', `${where} is an exact copy of ${src.cards[copyOf].photo || `card ${copyOf + 1}`}: skipped`)); return; }
     const cIss = [];
-    if (!name) { cIss.push(issue('err', 'No cage number')); }
-    if (plan.cages.some(c => c.key === lc(name))) cIss.push(issue('err', `Cage ${name} appears twice in this file`));
+    const number = norm(card.cage_number);
+    if (!number) { cIss.push(issue('err', 'No cage number')); }
+    const twin = number && plan.cages.find(c => c.key === lc(number) && bcDigits(c.data.barcode) && bcDigits(c.data.barcode) === bcDigits(card.barcode));
+    if (twin) cIss.push(issue('err', `Cage ${number} appears twice in this file with the same barcode but different details (${twin.src}). Check which card is right.`));
+    let name = twin || !number ? number : resolveCageName(plan, { name: number, barcode: norm(card.barcode) }, cIss);
+    if (name === number && number && !twin && plan.cages.some(c => c.key === lc(name))) {
+      // Re-importing the same cards: a lettered cage already in the app with this line and these mice is this card.
+      const dobs = (card.animals || []).map(a => parseDate(a.dob || '')).filter(Boolean);
+      const known = DB.cages.find(c => sameNumber(c.name, name) && !plan.cages.some(p => p.key === lc(c.name)) && lc(c.line) === lc(card.header)
+        && dobs.every(d => miceIn(c.id, true).some(m => m.dob === d)));
+      if (known) name = known.name;
+      else {
+        const n = nextFreeCageName(plan, name);
+        cIss.push(issue('warn', `Cage ${number} appears twice in this file with different details: this card added as ${n}. Rename it on the cage page if you prefer.`));
+        name = n;
+      }
+    }
     const rawNum = (String(card.lab_cage_raw || '').match(/\d+/) || [])[0];
     if (rawNum && name && rawNum !== (name.match(/\d+/) || [])[0]) cIss.push(issue('warn', `Label "${card.lab_cage_raw}" doesn't match cage ${name}`));
     if (/^YZ-/i.test(norm(card.lab_cage_raw)) && !/-YZ$/i.test(name)) cIss.push(issue('warn', `YZ label but cage name has no -YZ suffix`));
     const bc = checkBarcode(card.barcode, name);
-    if (bc && !bc.ok) cIss.push(issue('warn', bc.msg));
+    if (bc && !bc.ok) cIss.push(issue('info', bc.msg + BARCODE_HINT));
     if (card.uncertain?.includes('header')) cIss.push(issue('warn', 'Line name (header) marked uncertain'));
     if (card.notes) cIss.push(issue('info', 'Card note: ' + card.notes));
     let paired = '';
@@ -167,6 +210,7 @@ function planFromCards(src) {
       notes: [card.notes, card.photo ? 'Card photo ' + card.photo : ''].filter(Boolean).join(' · '), wfbr: null,
     };
     const cp = addCagePlan(plan, cage, cIss, where);
+    if (twin) cp.key += '#' + ci; // keep the first card's cage importable
 
     // Parents: rules from the lab — no strain + no DOB = not in cage; DOB but no strain = same strain as other parent (same sex first).
     const animals = (card.animals || []).map(a => ({ ...a, dobISO: parseDate(a.dob || ''), strainC: noteStrain(plan, a.strain || a.strain_raw, where) }));
@@ -194,7 +238,7 @@ function planFromCards(src) {
         strain, cageName: name, notes: a.slot ? `Breeder card slot ${a.slot}` : '', wfbr: '',
       };
       pendingNames.push(mouseBaseName(strain, m.dob, name));
-      const mp = { data: m, issues: iss, include: true, action: 'new', cageKey: lc(name), src: `${where} ${a.slot}` };
+      const mp = { data: m, issues: iss, include: true, action: 'new', cageKey: cp.key, src: `${where} ${a.slot}` };
       const same = cp.existing && miceIn(cp.existing.id, true).find(x => x.sex === sex && x.dob === m.dob && x.strain === strain && !plan.mice.some(q => q.existing === x));
       if (same) { mp.existing = same; mp.action = 'skip'; mp.include = false; iss.push(issue('info', `Already in the app as ${same.name}: skipped`)); }
       plan.mice.push(mp);
@@ -212,7 +256,7 @@ function planFromCards(src) {
       const status = litterStatusFrom(l.comments, weaned);
       if (status === 'Active' && born && daysBetween(born, today) > 35) iss.push(issue('warn', `Still open but born ${daysBetween(born, today)} days ago: probably weaned (mark it after import)`));
       if (!born) iss.push(issue('info', 'No litter DOB'));
-      plan.litters.push({ data: { cageName: name, paired: lp || '', born: born || '', pups: norm(l.pups), weaned: weaned || '', females: norm(l.females), males: norm(l.males), status, comments: norm(l.comments) }, issues: iss, include: true, action: 'new', cageKey: lc(name), src: where });
+      plan.litters.push({ data: { cageName: name, paired: lp || '', born: born || '', pups: norm(l.pups), weaned: weaned || '', females: norm(l.females), males: norm(l.males), status, comments: norm(l.comments) }, issues: iss, include: true, action: 'new', cageKey: cp.key, src: where });
     }
   });
   const finals = uniqueNames(pendingNames, taken);
@@ -230,8 +274,12 @@ function planFromAnimals(src) {
   const seenNames = new Map();
   const taken = takenMouseNames();
   const genBases = [];
+  const rowSeen = new Map();
   for (const r of src.rows) {
     const iss = [];
+    const sig = r.cells.join('\u0001');
+    if (rowSeen.has(sig)) { plan.notes.push(issue('info', `Row ${r._row} is an exact copy of row ${rowSeen.get(sig)}: skipped`)); continue; }
+    rowSeen.set(sig, r._row);
     const cageName = get(r, 'cage');
     const strainR = noteStrain(plan, get(r, 'strain'), 'row ' + r._row);
     const dob = parseDate(get(r, 'dob'));
@@ -260,15 +308,45 @@ function planFromAnimals(src) {
       if (ex) { p.existing = ex; p.action = 'skip'; p.include = false; iss.push(issue('warn', `A mouse with this name is already in the app (cage ${cageOf(ex.cageId)?.name || 'none'}). Skipped unless you choose Update.`)); }
     }
     plan.mice.push(p);
+    r._plan = p;
     if (cageName) {
-      if (!cageRows.has(lc(cageName))) cageRows.set(lc(cageName), { name: cageName, rows: [] });
-      cageRows.get(lc(cageName)).rows.push(r);
+      // Rows with the same cage number but different barcodes are different cages.
+      const bc = bcDigits(get(r, 'barcode')), k = lc(cageName) + '|' + bc;
+      if (!cageRows.has(k)) cageRows.set(k, { name: cageName, bc, rows: [] });
+      cageRows.get(k).rows.push(r);
     }
   }
+  // Rows with no barcode join the cage of that number when only one barcode is used for it.
+  for (const [k, g] of [...cageRows]) {
+    if (g.bc) continue;
+    const coded = [...cageRows.values()].filter(x => x.bc && lc(x.name) === lc(g.name));
+    if (coded.length === 1) { coded[0].rows.push(...g.rows); cageRows.delete(k); }
+    else if (coded.length > 1) g.noBarcodeNote = true;
+  }
+  const groups = [...cageRows.values()];
+  for (const g of groups) {
+    g.iss = [];
+    const bcRaw = g.bc ? get(g.rows[0], 'barcode') : '';
+    const homes = new Set(g.rows.map(r => r._plan.existing?.cageId));
+    const home = !g.bc && homes.size === 1 && cageOf([...homes][0]);
+    if (home && sameNumber(home.name, g.name)) g.final = home.name; // re-import: these mice are already in that cage
+    else {
+      if (g.noBarcodeNote) g.iss.push(issue('warn', `Cage number ${g.name} has several barcodes in this file; these rows have none, so they are kept as their own cage`));
+      g.final = resolveCageName(plan, { name: g.name, barcode: bcRaw }, g.iss);
+      if (plan.cages.some(c => c.key === lc(g.final))) {
+        const n = nextFreeCageName(plan, g.final);
+        g.iss.push(issue('warn', `Cage number ${g.name} is used by more than one cage in this file: these rows added as ${n}. Rename it on the cage page if you prefer.`));
+        g.final = n;
+      }
+    }
+    plan.cages.push({ key: lc(g.final), data: { name: g.final, barcode: bcRaw }, placeholder: true }); // claims the name for the next group
+    for (const r of g.rows) { r._plan.data.cageName = g.final; r._plan.cageKey = lc(g.final); }
+  }
+  plan.cages = plan.cages.filter(c => !c.placeholder);
+  plan.mice.forEach(p => { if (p.genIndex >= 0) genBases[p.genIndex] = mouseBaseName(p.data.strain, p.data.dob, p.data.cageName); });
   const gen = uniqueNames(genBases, new Set([...taken, ...seenNames.keys()]));
   plan.mice.forEach(p => { if (p.genIndex >= 0) p.data.name = gen[p.genIndex]; });
-  for (const { name, rows } of cageRows.values()) {
-    const iss = [];
+  for (const { final: name, rows, iss } of groups) {
     const pick = f => { const vals = [...new Set(rows.map(r => get(r, f)).filter(Boolean))]; if (vals.length > 1) iss.push(issue('warn', `Rows disagree on ${FIELD_LABELS[f]}: ${vals.join(' / ')} (using "${vals[0]}")`)); return vals[0] || ''; };
     const purposeRaw = pick('purpose');
     const purpose = normPurpose(purposeRaw);
@@ -282,7 +360,7 @@ function planFromAnimals(src) {
     if (prow === null) { iss.push(issue('warn', `Row "${cage.row}" isn't a letter or number: left blank`)); cage.row = ''; } else cage.row = prow;
     if (cage.col && !/^\d+$/.test(cage.col)) { iss.push(issue('warn', `Column "${cage.col}" isn't a number: left blank`)); cage.col = ''; }
     if (!purposeRaw && !cageNamed(name)) iss.push(issue('info', 'No Cage Purpose in file: set to Holding'));
-    if (cage.barcode) { const bc = checkBarcode(cage.barcode, name); if (bc && !bc.ok) iss.push(issue('warn', bc.msg)); }
+    if (cage.barcode) { const bc = checkBarcode(cage.barcode, name); if (bc && !bc.ok) iss.push(issue('info', bc.msg + BARCODE_HINT)); }
     addCagePlan(plan, cage, iss, rows.map(r => 'row ' + r._row).join(', '));
   }
   // Dam/Sire should name known mice (in app or file).

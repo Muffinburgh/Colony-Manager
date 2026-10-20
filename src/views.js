@@ -251,7 +251,7 @@ function viewCage(id) {
       <b>Line</b><span>${esc(c.line) || '<span class="muted">—</span>'}</span>
       <b>Mice</b><span>${n.F} ♀ · ${n.M} ♂${n.U ? ' · ' + n.U + ' ?' : ''}</span>
       ${c.purpose === 'Breeding' ? `<b>Date paired</b><span>${fmtDate(c.paired) || '—'}${c.paired ? ` <span class="muted">(${daysBetween(c.paired, todayISO())} d ago)</span>` : ''}</span>` : ''}
-      <b>Barcode</b><span>${esc(c.barcode) || '—'}${c.barcode ? (() => { const b = checkBarcode(c.barcode, c.name); return b ? ` <span class="badge ${b.ok ? 'b-ok' : 'b-warn'}" title="${esc(b.msg)}">${b.ok ? 'fits series' : 'check'}</span>` : ''; })() : ''}</span>
+      <b>Barcode</b><span>${esc(c.barcode) || '—'}${c.barcode ? (() => { const b = checkBarcode(c.barcode, c.name); return b ? ` <span class="badge ${b.ok ? 'b-ok' : ''}" title="${esc(b.ok ? b.msg : b.msg + BARCODE_HINT)}">${b.ok ? 'fits series' : 'no known series'}</span>` : ''; })() : ''}</span>
       <b>Location</b><span>${esc([c.building, c.room].filter(Boolean).join(' / '))} ${esc(cageLocation(c)) || '<span class="muted">not placed</span>'}</span>
       <b>Owner · protocol</b><span>${esc(c.owner)} · ${esc(c.protocol)}</span>
       ${c.notes ? `<b>Notes</b><span>${esc(c.notes)}</span>` : ''}
@@ -380,7 +380,7 @@ function viewSettings() {
     <label class="f"><span>Wean at (days old)</span><input name="weanDays" type="number" min="14" max="35" value="${esc(s.weanDays)}"></label>
     <label class="f"><span>Rack sides (comma separated; blank = none)</span><input name="sides" value="${esc((s.sides || []).join(', '))}"></label>
     <label class="f wide"><span>Racks: one per line as <code>name, rows, columns</code></span><textarea name="racks" rows="3">${esc(s.racks.map(r => `${r.name}, ${r.rows}, ${r.cols}`).join('\n'))}</textarea></label>
-    <label class="f wide"><span>Barcode series (barcode = base + cage number): one per line as <code>label, base, suffix</code></span><textarea name="series" rows="5">${esc(s.series.map(x => `${x.label}, ${x.base}, ${x.suffix}`).join('\n'))}</textarea></label>
+    <label class="f wide"><span>Barcode series (barcode = base + cage number; a hint only, since not every printing follows it): one per line as <code>label, base, suffix</code></span><textarea name="series" rows="5">${esc(s.series.map(x => `${x.label}, ${x.base}, ${x.suffix}`).join('\n'))}</textarea></label>
   </div><div class="row" style="margin-top:10px"><button class="btn primary" data-act="settings-save">Save settings</button></div></div>
   <div class="panel"><h2 style="margin-top:0">About</h2><p class="small muted">Colony Manager v${APP_VERSION}. Runs fully offline in this one file. ${DB.cages.length} cages, ${DB.mice.length} mice, ${DB.litters.length} litters, ${DB.log.length} log entries.</p></div>`;
 }
