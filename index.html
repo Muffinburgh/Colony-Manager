@@ -184,6 +184,10 @@ td input.cell{width:60px;padding:2px 4px}
   .prack .h{border:0;min-height:0;text-align:center;font-weight:700}
 }
 
+th.sortable { cursor: pointer; user-select: none; white-space: nowrap; }
+th.sortable:hover { text-decoration: underline; }
+input.cell.name { width: 7em; font-weight: 600; }
+
 </style>
 </head>
 <body>
@@ -1717,7 +1721,7 @@ var XLSX={};function make_xlsx_lib(a){a.version="0.18.5",a.style_version="1.2.0"
 <script>
 'use strict';
 /* ===== Colony Manager: core (data, dates, strains, saving) ===== */
-const APP_VERSION = '2.0';
+const APP_VERSION = '2.1';
 const $ = (s, el = document) => el.querySelector(s);
 const $$ = (s, el = document) => [...el.querySelectorAll(s)];
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -1973,7 +1977,7 @@ function undo() {
 const DATA_FILE = 'colony-data.json';
 // Browser storage is scoped to this copy of the app (this build + where the file sits), so every new
 // download starts with a clean slate instead of picking up data left in the browser by another copy.
-const COPY_KEY = (() => { const s = '20261020224440630709|' + decodeURIComponent(location.pathname); let h = 2166136261; for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 16777619); } return 'copy-' + (h >>> 0).toString(36) + ':'; })();
+const COPY_KEY = (() => { const s = '20261020230154407805|' + decodeURIComponent(location.pathname); let h = 2166136261; for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 16777619); } return 'copy-' + (h >>> 0).toString(36) + ':'; })();
 const idb = {
   _db: null,
   open() {
@@ -2279,6 +2283,9 @@ function issue(level, msg) { return { level, msg }; }
 function newPlan(src) { return { source: src.source, kind: src.kind, cages: [], mice: [], litters: [], newStrains: new Map(), notes: [] }; }
 function noteStrain(plan, raw, where) {
   const r = canonStrain(raw);
+  // Two new spellings that differ only in capitals are one strain: use the first one seen.
+  const first = r.name && !r.known && [...plan.newStrains.keys()].find(k => lc(k) === lc(r.name));
+  if (first && first !== r.name) { r.name = first; r.changed = true; }
   if (r.name && !r.known) { if (!plan.newStrains.has(r.name)) plan.newStrains.set(r.name, { name: r.name, where: [], add: true }); plan.newStrains.get(r.name).where.push(where); }
   return r;
 }
@@ -2305,7 +2312,7 @@ function resolveCageName(plan, data, iss) {
   const other = users(name).find(c => bc && bcDigits(c.barcode) && bcDigits(c.barcode) !== bc);
   if (!other) return name;
   const n = nextFreeCageName(plan, name);
-  iss.push(issue('warn', `Cage number ${name} is already used by a cage with barcode ${other.barcode}: added as ${n}. Rename it on the cage page if you prefer.`));
+  iss.push(issue('warn', `Cage number ${name} is already used by a cage with barcode ${other.barcode}: added as ${n}. Type another name in its box to change this.`));
   return n;
 }
 function addCagePlan(plan, data, issues, src) {
@@ -2337,10 +2344,15 @@ function planFromCards(src) {
     const cIss = [];
     const number = norm(card.cage_number);
     if (!number) { cIss.push(issue('err', 'No cage number')); }
-    const twin = number && plan.cages.find(c => c.key === lc(number) && bcDigits(c.data.barcode) && bcDigits(c.data.barcode) === bcDigits(card.barcode));
-    if (twin) cIss.push(issue('err', `Cage ${number} appears twice in this file with the same barcode but different details (${twin.src}). Check which card is right.`));
-    let name = twin || !number ? number : resolveCageName(plan, { name: number, barcode: norm(card.barcode) }, cIss);
-    if (name === number && number && !twin && plan.cages.some(c => c.key === lc(name))) {
+    const ov = norm((src.overrides || {})[where]);
+    const twin = !ov && number && plan.cages.find(c => c.key === lc(number) && bcDigits(c.data.barcode) && bcDigits(c.data.barcode) === bcDigits(card.barcode));
+    if (twin) cIss.push(issue('err', `Cage ${number} appears twice in this file with the same barcode but different details (${twin.src}). Check which card is right, or type a name for this one.`));
+    let name = ov ? ov : twin || !number ? number : resolveCageName(plan, { name: number, barcode: norm(card.barcode) }, cIss);
+    if (ov) {
+      cIss.push(issue('info', `Name set by you${cageNamed(ov) ? `; cage ${cageNamed(ov).name} is already in the app, so this card is added to it` : ''}`));
+      const other = plan.cages.find(c => c.key === lc(ov));
+      if (other) cIss.push(issue('err', `${other.src} is also being imported as ${ov}. Give one of them another name.`));
+    } else if (name === number && number && !twin && plan.cages.some(c => c.key === lc(name))) {
       // Re-importing the same cards: a lettered cage already in the app with this line and these mice is this card.
       const dobs = (card.animals || []).map(a => parseDate(a.dob || '')).filter(Boolean);
       const known = DB.cages.find(c => sameNumber(c.name, name) && !plan.cages.some(p => p.key === lc(c.name)) && lc(c.line) === lc(card.header)
@@ -2348,27 +2360,62 @@ function planFromCards(src) {
       if (known) name = known.name;
       else {
         const n = nextFreeCageName(plan, name);
-        cIss.push(issue('warn', `Cage ${number} appears twice in this file with different details: this card added as ${n}. Rename it on the cage page if you prefer.`));
+        cIss.push(issue('warn', `Cage ${number} appears twice in this file with different details: this card added as ${n}. Type another name in its box to change this.`));
         name = n;
       }
     }
     const rawNum = (String(card.lab_cage_raw || '').match(/\d+/) || [])[0];
     if (rawNum && name && rawNum !== (name.match(/\d+/) || [])[0]) cIss.push(issue('warn', `Label "${card.lab_cage_raw}" doesn't match cage ${name}`));
-    if (/^YZ-/i.test(norm(card.lab_cage_raw)) && !/-YZ$/i.test(name)) cIss.push(issue('warn', `YZ label but cage name has no -YZ suffix`));
     const bc = checkBarcode(card.barcode, name);
     if (bc && !bc.ok) cIss.push(issue('info', bc.msg + BARCODE_HINT));
     if (card.uncertain?.includes('header')) cIss.push(issue('warn', 'Line name (header) marked uncertain'));
     if (card.notes) cIss.push(issue('info', 'Card note: ' + card.notes));
     let paired = '';
     for (const l of card.litters || []) if (l.paired) { paired = parseDate(l.paired) || ''; if (paired) break; }
+    // Breeder cards list parents in animals[]; weaning, in-house, receiving and sentinel cards give a count, sex and DOB.
+    const breeder = Array.isArray(card.animals) && card.animals.length > 0 || /breed/i.test(card.card_type || '');
+    const extra = breeder ? [] : [
+      card.header && 'Card header: ' + norm(card.header), card.dow && 'Weaned ' + norm(card.dow), card.wfbr && 'Weaned from #' + norm(card.wfbr),
+      ...(card.procedures || []).map(x => 'Procedure: ' + [x.date, x.procedure].map(norm).filter(Boolean).join(' ')).filter(x => x !== 'Procedure: '),
+    ].filter(Boolean);
     const cage = {
-      name, purpose: 'Breeding', status: 'Active', line: norm(card.header), barcode: norm(card.barcode),
+      name, purpose: breeder ? 'Breeding' : /sentinel/i.test(card.card_type || '') ? 'Other' : 'Holding', status: 'Active', line: breeder ? norm(card.header) : '', barcode: norm(card.barcode),
       owner: norm(card.pi) || DB.settings.owner, protocol: norm(card.protocol) || DB.settings.protocol,
       building: '', room: '', rack: '', side: '', row: '', col: '', paired,
-      notes: [card.notes, card.photo ? 'Card photo ' + card.photo : ''].filter(Boolean).join(' · '), wfbr: null,
+      notes: [card.card_type && !breeder ? card.card_type + ' card' : '', ...extra, card.notes, card.photo ? 'Card photo ' + card.photo : ''].filter(Boolean).join(' · '), wfbr: null,
     };
     const cp = addCagePlan(plan, cage, cIss, where);
+    cp.okey = where;
     if (twin) cp.key += '#' + ci; // keep the first card's cage importable
+    if (!breeder) {
+      const strainC = noteStrain(plan, card.strain || card.strain_raw, where);
+      const dob = parseDate(card.dob || ''), sex = normSex(card.sex);
+      const ids = (card.mice || []).filter(x => norm(x.id) || norm(x.genotype));
+      const count = parseInt(card.count, 10);
+      const n = ids.length || (count > 0 ? count : 0);
+      const unc = card.uncertain || [];
+      if (!n) cp.issues.push(issue('warn', 'No mouse count on the card: no mice added'));
+      if (ids.length && count > 0 && count !== ids.length) cp.issues.push(issue('warn', `Card count is ${count} but ${ids.length} IDs are listed: ${ids.length} mice added`));
+      for (const u of unc) cp.issues.push(issue('warn', `${{ count: 'Count', dob: 'DOB', strain: 'Strain', mice: 'Mouse IDs/genotypes', sex: 'Sex', wfbr: 'WFBR', dow: 'Wean date', procedures: 'Procedures' }[u] || u} marked uncertain on card`));
+      for (let i = 0; i < n; i++) {
+        const iss = [], idr = ids[i] || {};
+        if (!strainC.name) iss.push(issue('warn', 'No strain on card'));
+        else if (!strainC.known) iss.push(issue('warn', `New strain "${strainC.name}"`));
+        else if (strainC.changed) iss.push(issue('info', `Strain "${card.strain_raw || card.strain}" → "${strainC.name}"`));
+        if (dob === null) iss.push(issue('err', `DOB "${card.dob}" can't be read`));
+        else if (!dob) iss.push(issue('warn', 'No DOB'));
+        else if (dob > today) iss.push(issue('err', 'DOB is in the future'));
+        if (!sex) iss.push(issue('warn', 'Sex not marked on card'));
+        const m = { name: '', status: 'Live', sex: sex || 'U', dam: '', sire: '', dob: dob || '', color: '', earTag: norm(idr.id), protocol: cage.protocol, owner: cage.owner,
+          strain: strainC.name, cageName: name, notes: norm(idr.genotype) ? 'Genotype ' + norm(idr.genotype) : '', wfbr: '' };
+        pendingNames.push(mouseBaseName(m.strain, m.dob, name));
+        const mp = { data: m, issues: iss, include: true, action: 'new', cageKey: cp.key, src: `${where}${m.earTag ? ' ID ' + m.earTag : ` mouse ${i + 1}`}` };
+        const same = cp.existing && miceIn(cp.existing.id, true).find(x => x.sex === m.sex && x.dob === m.dob && x.strain === m.strain && (!m.earTag || x.earTag === m.earTag) && !plan.mice.some(q => q.existing === x));
+        if (same) { mp.existing = same; mp.action = 'skip'; mp.include = false; iss.push(issue('info', `Already in the app as ${same.name}: skipped`)); }
+        plan.mice.push(mp);
+      }
+      return;
+    }
 
     // Parents: rules from the lab — no strain + no DOB = not in cage; DOB but no strain = same strain as other parent (same sex first).
     const animals = (card.animals || []).map(a => ({ ...a, dobISO: parseDate(a.dob || ''), strainC: noteStrain(plan, a.strain || a.strain_raw, where) }));
@@ -2487,13 +2534,19 @@ function planFromAnimals(src) {
     const bcRaw = g.bc ? get(g.rows[0], 'barcode') : '';
     const homes = new Set(g.rows.map(r => r._plan.existing?.cageId));
     const home = !g.bc && homes.size === 1 && cageOf([...homes][0]);
-    if (home && sameNumber(home.name, g.name)) g.final = home.name; // re-import: these mice are already in that cage
+    g.okey = g.rows.map(r => 'row ' + r._row).join(', ');
+    const ov = norm((src.overrides || {})[g.okey]);
+    if (ov) {
+      g.final = ov;
+      g.iss.push(issue('info', `Name set by you${cageNamed(ov) ? `; cage ${cageNamed(ov).name} is already in the app, so these rows are added to it` : ''}`));
+      if (plan.cages.some(c => c.key === lc(ov))) g.iss.push(issue('err', `Another cage in this file is also being imported as ${ov}. Give one of them another name.`));
+    } else if (home && sameNumber(home.name, g.name)) g.final = home.name; // re-import: these mice are already in that cage
     else {
       if (g.noBarcodeNote) g.iss.push(issue('warn', `Cage number ${g.name} has several barcodes in this file; these rows have none, so they are kept as their own cage`));
       g.final = resolveCageName(plan, { name: g.name, barcode: bcRaw }, g.iss);
       if (plan.cages.some(c => c.key === lc(g.final))) {
         const n = nextFreeCageName(plan, g.final);
-        g.iss.push(issue('warn', `Cage number ${g.name} is used by more than one cage in this file: these rows added as ${n}. Rename it on the cage page if you prefer.`));
+        g.iss.push(issue('warn', `Cage number ${g.name} is used by more than one cage in this file: these rows added as ${n}. Type another name in its box to change this.`));
         g.final = n;
       }
     }
@@ -2504,7 +2557,7 @@ function planFromAnimals(src) {
   plan.mice.forEach(p => { if (p.genIndex >= 0) genBases[p.genIndex] = mouseBaseName(p.data.strain, p.data.dob, p.data.cageName); });
   const gen = uniqueNames(genBases, new Set([...taken, ...seenNames.keys()]));
   plan.mice.forEach(p => { if (p.genIndex >= 0) p.data.name = gen[p.genIndex]; });
-  for (const { final: name, rows, iss } of groups) {
+  for (const { final: name, rows, iss, okey } of groups) {
     const pick = f => { const vals = [...new Set(rows.map(r => get(r, f)).filter(Boolean))]; if (vals.length > 1) iss.push(issue('warn', `Rows disagree on ${FIELD_LABELS[f]}: ${vals.join(' / ')} (using "${vals[0]}")`)); return vals[0] || ''; };
     const purposeRaw = pick('purpose');
     const purpose = normPurpose(purposeRaw);
@@ -2519,7 +2572,7 @@ function planFromAnimals(src) {
     if (cage.col && !/^\d+$/.test(cage.col)) { iss.push(issue('warn', `Column "${cage.col}" isn't a number: left blank`)); cage.col = ''; }
     if (!purposeRaw && !cageNamed(name)) iss.push(issue('info', 'No Cage Purpose in file: set to Holding'));
     if (cage.barcode) { const bc = checkBarcode(cage.barcode, name); if (bc && !bc.ok) iss.push(issue('info', bc.msg + BARCODE_HINT)); }
-    addCagePlan(plan, cage, iss, rows.map(r => 'row ' + r._row).join(', '));
+    addCagePlan(plan, cage, iss, okey).okey = okey;
   }
   // Dam/Sire should name known mice (in app or file).
   const known = new Set([...DB.mice.map(m => lc(m.name)), ...plan.mice.map(p => lc(p.data.name))]);
@@ -3032,7 +3085,7 @@ function viewImport() {
   const { plan, src } = IMP;
   const cnt = arr => ({ inc: arr.filter(p => p.include).length, err: arr.filter(p => p.issues.some(i => i.level === 'err')).length, warn: arr.filter(p => p.issues.some(i => i.level === 'warn')).length });
   const cc = cnt(plan.cages), mc = cnt(plan.mice), lcnt = cnt(plan.litters);
-  const kindLabel = { cards: 'Breeder-card JSON', animals: 'Animals (mLIMS format)', litters: 'Matings & litters' }[src.kind];
+  const kindLabel = { cards: 'Cage-card JSON', animals: 'Animals (mLIMS format)', litters: 'Matings & litters' }[src.kind];
   h += `<div class="panel"><div class="row"><b>${esc(src.source)}</b><span class="badge b-info">${kindLabel}</span>
     ${src.kind !== 'cards' ? `<select data-act-change="imp-kind"><option value="animals" ${src.kind === 'animals' ? 'selected' : ''}>Treat as animals file</option><option value="litters" ${src.kind === 'litters' ? 'selected' : ''}>Treat as litters file</option></select>` : ''}
     <span class="spacer"></span><button class="btn" data-act="imp-cancel">Cancel</button></div>
@@ -3047,11 +3100,17 @@ function viewImport() {
       <span class="spacer"></span><label class="small"><input type="checkbox" data-act-change="imp-only" ${IMP.onlyProblems ? 'checked' : ''}> Show only rows with ✖ or ⚠</label>
       <button class="btn primary" data-act="imp-commit">Import</button></div></div>`;
   const show = p => !IMP.onlyProblems || p.issues.some(i => i.level !== 'info');
-  if (plan.cages.length) h += `<h2>Cages (${cc.inc} of ${plan.cages.length} included${cc.err ? `, ${cc.err} with errors` : ''})</h2><div class="tablewrap"><table class="t"><tr><th></th><th>Cage</th><th></th><th>Purpose</th><th>Line</th><th>Barcode</th><th>Rack / side</th><th>Row</th><th>Col</th><th>Problems</th></tr>
-    ${plan.cages.map((p, i) => show(p) ? `<tr class="${p.include ? '' : 'off'}"><td><input type="checkbox" data-imp="cages:${i}" ${p.include ? 'checked' : ''} ${p.blocked ? 'disabled' : ''}></td><td><b>${esc(p.data.name)}</b><div class="small muted">${esc(p.src)}</div></td><td>${p.action === 'new' ? '<span class="badge b-ok">new</span>' : '<span class="badge">in app</span>'}</td><td>${esc(p.action === 'new' ? p.data.purpose || 'Holding' : p.existing.purpose)}</td><td>${esc(p.data.line)}</td><td class="small">${esc(p.data.barcode)}</td><td class="small">${esc([p.data.rack || IMP.defaults.rack, p.data.side || IMP.defaults.side].filter(Boolean).join(' / '))}</td>
-    <td>${p.action === 'new' ? `<input class="cell" data-impf="cages:${i}:row" value="${esc(rowLabel(p.data.row))}" placeholder="A">` : esc(rowLabel(p.existing.row))}</td><td>${p.action === 'new' ? `<input class="cell" data-impf="cages:${i}:col" value="${esc(p.data.col)}">` : esc(p.existing.col)}</td><td>${issuesHtml(p.issues)}</td></tr>` : '').join('')}</table></div>`;
-  if (plan.mice.length) h += `<h2>Mice (${mc.inc} of ${plan.mice.length} included${mc.err ? `, ${mc.err} with errors` : ''}${mc.warn ? `, ${mc.warn} with warnings` : ''})</h2><div class="tablewrap"><table class="t"><tr><th></th><th>Name</th><th></th><th>Sex</th><th>DOB</th><th>Strain</th><th>Ear tag</th><th>Cage</th><th>Status</th><th>Problems</th></tr>
-    ${plan.mice.map((p, i) => show(p) ? `<tr class="${p.include ? '' : 'off'}"><td><input type="checkbox" data-imp="mice:${i}" ${p.include ? 'checked' : ''} ${p.blocked ? 'disabled' : ''}></td><td>${esc(p.data.name)}<div class="small muted">${esc(p.src)}</div></td>
+  const cageStrains = p => [...new Set(plan.mice.filter(m => m.cageKey === p.key).map(m => m.data.strain).filter(Boolean))].join(', ') || (p.existing ? [...new Set(miceIn(p.existing.id).map(m => m.strain))].join(', ') : '');
+  const probRank = p => p.issues.some(i => i.level === 'err') ? 0 : p.issues.some(i => i.level === 'warn') ? 1 : 2;
+  const CAGE_SORT = { cage: p => p.data.name, status: p => p.action, strain: cageStrains, purpose: p => p.data.purpose, barcode: p => p.data.barcode, source: p => p.src, problems: probRank };
+  const MOUSE_SORT = { name: p => p.data.name, sex: p => p.data.sex, dob: p => p.data.dob, strain: p => p.data.strain, cage: p => p.data.cageName, problems: probRank };
+  const sorted = (arr, t, keys) => { const s = IMP.sort?.[t]; const idx = arr.map((p, i) => i); if (!s || !keys[s.k]) return idx; const f = keys[s.k]; return idx.sort((x, y) => s.d * (typeof f(arr[x]) === 'number' ? f(arr[x]) - f(arr[y]) : natCmp(f(arr[x]), f(arr[y]))) || x - y); };
+  const th = (t, k, label) => { const s = IMP.sort?.[t]; return `<th class="sortable" data-act="imp-sort" data-t="${t}" data-k="${k}" title="Sort">${label}${s && s.k === k ? (s.d > 0 ? ' ▲' : ' ▼') : ''}</th>`; };
+  if (plan.cages.length) h += `<h2>Cages (${cc.inc} of ${plan.cages.length} included${cc.err ? `, ${cc.err} with errors` : ''})</h2><p class="small muted">Click a column heading to sort. To change how a cage is imported, type a different name in its box: a new name adds it as its own cage, and the name of a cage already in the app adds these mice to that cage.</p><div class="tablewrap"><table class="t"><tr><th></th>${th('cages', 'cage', 'Cage')}${th('cages', 'status', '')}${th('cages', 'purpose', 'Purpose')}${th('cages', 'strain', 'Strain')}<th>Line</th>${th('cages', 'barcode', 'Barcode')}<th>Rack / side</th><th>Row</th><th>Col</th>${th('cages', 'problems', 'Problems')}</tr>
+    ${sorted(plan.cages, 'cages', CAGE_SORT).map(i => { const p = plan.cages[i]; return show(p) ? `<tr class="${p.include ? '' : 'off'}"><td><input type="checkbox" data-imp="cages:${i}" ${p.include ? 'checked' : ''} ${p.blocked ? 'disabled' : ''}></td><td>${p.okey ? `<input class="cell name" data-act-change="imp-rename" data-okey="${esc(p.okey)}" value="${esc(p.data.name)}" title="Type a name to override">` : `<b>${esc(p.data.name)}</b>`}<div class="small muted">${esc(p.src)}</div></td><td>${p.action === 'new' ? '<span class="badge b-ok">new</span>' : '<span class="badge">in app</span>'}</td><td>${esc(p.action === 'new' ? p.data.purpose || 'Holding' : p.existing.purpose)}</td><td class="small">${esc(cageStrains(p))}</td><td>${esc(p.data.line)}</td><td class="small">${esc(p.data.barcode)}</td><td class="small">${esc([p.data.rack || IMP.defaults.rack, p.data.side || IMP.defaults.side].filter(Boolean).join(' / '))}</td>
+    <td>${p.action === 'new' ? `<input class="cell" data-impf="cages:${i}:row" value="${esc(rowLabel(p.data.row))}" placeholder="A">` : esc(rowLabel(p.existing.row))}</td><td>${p.action === 'new' ? `<input class="cell" data-impf="cages:${i}:col" value="${esc(p.data.col)}">` : esc(p.existing.col)}</td><td>${issuesHtml(p.issues)}</td></tr>` : ''; }).join('')}</table></div>`;
+  if (plan.mice.length) h += `<h2>Mice (${mc.inc} of ${plan.mice.length} included${mc.err ? `, ${mc.err} with errors` : ''}${mc.warn ? `, ${mc.warn} with warnings` : ''})</h2><div class="tablewrap"><table class="t"><tr><th></th>${th('mice', 'name', 'Name')}<th></th>${th('mice', 'sex', 'Sex')}${th('mice', 'dob', 'DOB')}${th('mice', 'strain', 'Strain')}<th>Ear tag</th>${th('mice', 'cage', 'Cage')}<th>Status</th>${th('mice', 'problems', 'Problems')}</tr>
+    ${sorted(plan.mice, 'mice', MOUSE_SORT).map(i => [plan.mice[i], i]).map(([p, i]) => show(p) ? `<tr class="${p.include ? '' : 'off'}"><td><input type="checkbox" data-imp="mice:${i}" ${p.include ? 'checked' : ''} ${p.blocked ? 'disabled' : ''}></td><td>${esc(p.data.name)}<div class="small muted">${esc(p.src)}</div></td>
     <td>${p.existing ? `<select data-act-change="imp-mouse-action" data-i="${i}"><option value="skip" ${p.action === 'skip' ? 'selected' : ''}>Skip</option><option value="update" ${p.action === 'update' ? 'selected' : ''}>Update existing</option></select>` : '<span class="badge b-ok">new</span>'}</td>
     <td>${sexSpan(p.data.sex)}</td><td>${fmtDate(p.data.dob)}</td><td>${esc(p.data.strain)}</td><td>${esc(p.data.earTag)}</td><td>${esc(p.data.cageName)}</td><td>${esc(p.data.status)}</td><td>${issuesHtml(p.issues)}</td></tr>` : '').join('')}</table></div>`;
   if (plan.litters.length) h += `<h2>Litters (${lcnt.inc} of ${plan.litters.length} included${lcnt.err ? `, ${lcnt.err} with errors` : ''})</h2><div class="tablewrap"><table class="t"><tr><th></th><th>Cage</th><th>Paired</th><th>Born</th><th>Pups</th><th>♀</th><th>♂</th><th>Weaned</th><th>Status</th><th>Comments</th><th>Problems</th></tr>
@@ -3717,6 +3776,7 @@ const ACTIONS = {
     inp.click();
   },
   'strain-adopt': () => mutate('Added strains used by mice to the strain list', () => { const have = new Set(DB.strains.map(s => s.name)); [...new Set(DB.mice.map(m => m.strain).filter(s => s && !have.has(s)))].forEach(s => DB.strains.push({ name: s, aliases: [] })); }),
+  'imp-sort': el => { const t = el.dataset.t, k = el.dataset.k, cur = (IMP.sort = IMP.sort || {})[t]; IMP.sort[t] = { k, d: cur && cur.k === k ? -cur.d : 1 }; render(); },
   'imp-paste': () => startImport(null, $('#impText').value), 'imp-cancel': () => { IMP = null; render(); }, 'imp-commit': () => commitImport(),
   'imp-template': () => download('mLIMS-import-template.csv', toCSV([], [...MLIMS_COLS, ...EXTRA_COLS]), 'text/csv'),
   'imp-template-litters': () => download('matings-litters-template.csv', toCSV([], LITTER_COLS), 'text/csv'),
@@ -3766,6 +3826,13 @@ const CHANGE_ACTIONS = {
   'imp-kind': el => { IMP.src.kind = el.value; IMP.src.mapping = autoMap(IMP.src.headers, el.value === 'litters' ? LITTER_FIELDS : ANIMAL_FIELDS); rebuildPlan(); render(); },
   'imp-map': el => { IMP.src.mapping[el.dataset.f] = +el.value; rebuildPlan(); render(); },
   'imp-only': el => { IMP.onlyProblems = el.checked; render(); },
+  'imp-rename': el => {
+    const o = (IMP.src.overrides = IMP.src.overrides || {}); const v = norm(el.value); if (v) o[el.dataset.okey] = v; else delete o[el.dataset.okey];
+    const kept = new Map(IMP.plan.cages.filter(c => c.okey).map(c => [c.okey, { include: c.blocked ? undefined : c.include, row: c.data.row, col: c.data.col }])); // keep ticks and row/col typed so far
+    rebuildPlan();
+    for (const c of IMP.plan.cages) { const k = kept.get(c.okey); if (!k) continue; if (!c.blocked && k.include !== undefined) c.include = k.include; c.data.row = k.row; c.data.col = k.col; }
+    render();
+  },
   'imp-mouse-action': el => { const p = IMP.plan.mice[+el.dataset.i]; p.action = el.value; p.include = el.value !== 'skip' && !p.blocked; render(); },
   'imp-litter-status': el => { IMP.plan.litters[+el.dataset.i].data.status = el.value; },
 };
