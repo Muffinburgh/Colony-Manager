@@ -1721,7 +1721,7 @@ var XLSX={};function make_xlsx_lib(a){a.version="0.18.5",a.style_version="1.2.0"
 <script>
 'use strict';
 /* ===== Colony Manager: core (data, dates, strains, saving) ===== */
-const APP_VERSION = '2.1';
+const APP_VERSION = '2.2';
 const $ = (s, el = document) => el.querySelector(s);
 const $$ = (s, el = document) => [...el.querySelectorAll(s)];
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -1848,6 +1848,19 @@ function cageTitleParts(c) {
   if (!by.size) return null;
   return { cross: false, groups: [...by].map(([s, n]) => ({ s, ...n })) };
 }
+/** The cage a WFBR number points to: the cage with exactly that name, else the only breeding cage with that number (28 → 28-B). */
+function findBreeder(ref) {
+  const r = norm(ref), num = (r.match(/\d+/) || [])[0];
+  if (!num) return null;
+  const exact = cageNamed(r.replace(/^#/, '')) || cageNamed(num);
+  if (exact && exact.purpose === 'Breeding') return exact;
+  const sib = DB.cages.filter(c => c.purpose === 'Breeding' && lc(c.name).replace(/-[a-z]+$/, '') === num);
+  return sib.length === 1 ? sib[0] : exact || null;
+}
+/** Active non-breeding cages whose WFBR link is missing (or points to a cage that isn't an active breeder). */
+const unlinkedCages = () => DB.cages.filter(c => c.status === 'Active' && c.purpose !== 'Breeding' && !(c.wfbr?.cageId && cageOf(c.wfbr.cageId)?.purpose === 'Breeding' && cageOf(c.wfbr.cageId)?.status === 'Active'));
+/** WFBR numbers written in cage notes by card import ("Weaned from #28") that can be turned into links. */
+const wfbrFromNotes = () => DB.cages.filter(c => !c.wfbr?.cageId).map(c => { const m = String(c.notes || '').match(/Weaned from #([^·]+)/); const b = m && findBreeder(m[1]); return b && b.id !== c.id ? { c, b, ref: norm(m[1]) } : null; }).filter(Boolean);
 function cageTitleText(c) {
   const t = cageTitleParts(c);
   if (!t) return c.line || 'Cage ' + c.name;
@@ -1977,7 +1990,7 @@ function undo() {
 const DATA_FILE = 'colony-data.json';
 // Browser storage is scoped to this copy of the app (this build + where the file sits), so every new
 // download starts with a clean slate instead of picking up data left in the browser by another copy.
-const COPY_KEY = (() => { const s = '20261020230154407805|' + decodeURIComponent(location.pathname); let h = 2166136261; for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 16777619); } return 'copy-' + (h >>> 0).toString(36) + ':'; })();
+const COPY_KEY = (() => { const s = '20261021175608e193c4|' + decodeURIComponent(location.pathname); let h = 2166136261; for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 16777619); } return 'copy-' + (h >>> 0).toString(36) + ':'; })();
 const idb = {
   _db: null,
   open() {
@@ -2383,6 +2396,7 @@ function planFromCards(src) {
       owner: norm(card.pi) || DB.settings.owner, protocol: norm(card.protocol) || DB.settings.protocol,
       building: '', room: '', rack: '', side: '', row: '', col: '', paired,
       notes: [card.card_type && !breeder ? card.card_type + ' card' : '', ...extra, card.notes, card.photo ? 'Card photo ' + card.photo : ''].filter(Boolean).join(' · '), wfbr: null,
+      wfbrRef: breeder ? '' : norm(card.wfbr),
     };
     const cp = addCagePlan(plan, cage, cIss, where);
     cp.okey = where;
@@ -2466,6 +2480,24 @@ function planFromCards(src) {
   });
   const finals = uniqueNames(pendingNames, taken);
   plan.mice.forEach((p, i) => p.data.name = finals[i]);
+  // WFBR: link each weaned cage to its breeder (in the app or in this file).
+  for (const cp of plan.cages) {
+    const ref = cp.data.wfbrRef; if (!ref || (cp.existing && cp.existing.wfbr?.cageId)) continue;
+    const num = (ref.match(/\d+/) || [])[0];
+    const inFileAll = num ? plan.cages.filter(o => o !== cp && (o.key === lc(ref) || o.key === num)) : [];
+    const inFile = inFileAll.find(o => o.data.purpose === 'Breeding') || inFileAll[0];
+    const b = findBreeder(ref);
+    const target = b && b.purpose === 'Breeding' ? b.name : inFile ? inFile.data.name : b ? b.name : '';
+    const tPurpose = b && b.name === target ? b.purpose : inFile && inFile.data.name === target ? inFile.data.purpose : '';
+    if (target && tPurpose !== 'Breeding') {
+      cp.issues.push(issue('warn', `WFBR ${ref} is cage #${target}, which isn't a breeding cage: linked anyway; it shows under "Not linked to a breeder" on the breeders sheet until #${target} is set to Breeding`));
+      cp.data.wfbrTarget = target;
+    } else if (target) {
+      const sibs = DB.cages.filter(c => c.name !== target && lc(c.name).replace(/-[a-z]+$/, '') === num).map(c => c.name);
+      cp.issues.push(issue(sibs.length ? 'warn' : 'info', `Linked to breeder #${target} (WFBR ${ref})` + (sibs.length ? `. Cage ${sibs.join(', ')} also has this number; change the link on the cage page if it's that one.` : '')));
+      cp.data.wfbrTarget = target;
+    } else cp.issues.push(issue('warn', `WFBR "${ref}" isn't a cage in the app or this file: not linked (kept in the cage notes)`));
+  }
   finishPlan(plan);
   return plan;
 }
@@ -2635,6 +2667,7 @@ function applyPlan(plan, defaults) {
     if (p.action === 'new') {
       const d = { ...p.data, purpose: p.data.purpose || 'Holding' };
       for (const f of ['building', 'room', 'rack', 'side']) if (!d[f] && defaults[f]) d[f] = defaults[f];
+      delete d.wfbrRef; delete d.wfbrTarget;
       const c = { id: uid('c'), ...d, created: todayISO() };
       DB.cages.push(c); cageIdByKey.set(p.key, c.id); sum.cages++;
     } else if (p.existing) {
@@ -2656,6 +2689,12 @@ function applyPlan(plan, defaults) {
       DB.mice.push({ id: uid('m'), ...rest, cageId: cid || '', history: [{ date: todayISO(), to: cageName || '', note: 'imported from ' + plan.source }] });
       sum.mice++; sum.names.push(d.name);
     }
+  }
+  invalidate();
+  for (const p of plan.cages) {
+    if (!p.include || !p.data.wfbrTarget) continue;
+    const c = DB.cages.find(x => x.id === cageIdByKey.get(p.key)), b = cageNamed(p.data.wfbrTarget);
+    if (c && b && b.id !== c.id && !c.wfbr?.cageId) { c.wfbr = { cageId: b.id, litterId: '' }; sum.links = (sum.links || 0) + 1; }
   }
   invalidate();
   for (const p of plan.litters) {
@@ -3163,7 +3202,8 @@ function viewExport() {
   return `<h1>Export & print</h1>
   <div class="grid2">
   <div class="panel"><h2 style="margin-top:0">Export files</h2>
-    <div style="margin-bottom:14px;padding:10px 12px;background:#fff8e1;border:1px solid #f1d29b;border-radius:6px"><b>Breeders sheet</b> <span class="muted small">(one formatted Excel sheet: each breeder cage in yellow with its cross, parents and litters, and the holding cages weaned from it beside it)</span><br><button class="btn primary" data-act="exp-report" style="margin-top:6px">Download breeders sheet</button></div>
+    <div style="margin-bottom:14px;padding:10px 12px;background:#fff8e1;border:1px solid #f1d29b;border-radius:6px"><b>Breeders sheet</b> <span class="muted small">(one formatted Excel sheet: each breeder cage in yellow with its cross, parents and litters, and the holding cages weaned from it beside it)</span><br><button class="btn primary" data-act="exp-report" style="margin-top:6px">Download breeders sheet</button>
+      ${(() => { const n = wfbrFromNotes().length, u = unlinkedCages().length; return n ? `<div class="banner warn" style="margin-top:8px">${n} cages have a WFBR number from their card in the notes but aren't linked to that breeder yet. <button class="btn sm" data-act="link-wfbr">Review and link</button></div>` : u ? `<div class="small muted" style="margin-top:6px">${u} active cages aren't linked to a breeder; they're listed in their own group at the bottom of the sheet.</div>` : ''; })()}</div>
     <p class="small muted">Plain files below use the mLIMS import columns so they can be re-imported here or into mLIMS. Dates are written M-D-YYYY.</p>
     <div style="margin-bottom:10px"><b>Animals & cages</b> <span class="muted small">(mLIMS import columns + Strain, Cage Purpose, Cage Barcode)</span><br>
       <label class="small"><input type="checkbox" id="expAll"> include dead / sacrificed / transferred mice</label><br>
@@ -3241,7 +3281,7 @@ function sheetBreeders() {
   const cs = DB.cages.filter(c => c.status === 'Active' && c.purpose === 'Breeding').sort((a, b) => natCmp(cageTitleText(a), cageTitleText(b)) || natCmp(a.name, b.name));
   reportTitle(B, 'Breeding cages', `${subLine()} · ${cs.length} breeding cages · weaned cages (WFBR) are listed to the right of their breeder`);
   const H = 3, hs = xs({ font: { bold: true }, fill: XC.head, border: { bottom: xBorder('medium', '808080') } });
-  ['', 'Strain', 'DOB', 'Age', 'Ear tag', 'Pairing & litters', '', 'Weaned cage', 'Location', 'Mice', 'DOB', 'Strain', 'From litter'].forEach((h, i) => { if (i !== 6) B.set(H, i, h, hs); });
+  ['', 'Strain', 'DOB', 'Age', 'Ear tag', 'Pairing & litters', '', 'Weaned cage', 'Location', 'Mice', 'DOB', 'Strain', 'From litter / note'].forEach((h, i) => { if (i !== 6) B.set(H, i, h, hs); });
   let r = H + 2; const today = todayISO();
   for (const c of cs) {
     const ms = miceIn(c.id).sort((a, b) => natCmp(a.sex, b.sex) || natCmp(a.name, b.name));
@@ -3282,7 +3322,26 @@ function sheetBreeders() {
     }
     r += h + 2;
   }
-  if (!cs.length) B.set(r, 0, 'No active breeding cages.');
+  if (!cs.length) { B.set(r, 0, 'No active breeding cages.'); r += 2; }
+  // Cages with no breeder link go in their own block, in the same right-hand columns as weaned cages.
+  const un = unlinkedCages().sort((a, b) => natCmp(a.name, b.name));
+  if (un.length) {
+    const gh = xs({ font: { bold: true, sz: 12 }, fill: XC.grey, border: { top: xBorder('medium', '808080') } });
+    B.set(r, 0, `Not linked to a breeder (${un.length})`, gh); for (let k = 1; k <= 5; k++) B.style(r, k, gh); B.merge(r, 0, r, 4);
+    B.set(r, 5, 'No WFBR link. Set "Weaned from breeder" on the cage page to move a cage up to its breeder.', xs({ fill: XC.grey, font: { color: { rgb: XC.muted } }, border: { top: xBorder('medium', '808080') } }));
+    un.forEach((k, i) => {
+      const rr = r + 1 + i, kb = { bottom: xBorder('thin', 'D9D9D9') };
+      const km = miceIn(k.id), F = km.filter(x => x.sex === 'F').length, M = km.filter(x => x.sex === 'M').length;
+      const from = k.wfbr?.cageId ? cageOf(k.wfbr.cageId) : null, note = String(k.notes || '').match(/Weaned from #([^·]+)/);
+      B.set(rr, 7, '#' + k.name, xs({ font: { bold: true }, border: kb }));
+      B.set(rr, 8, cageLocation(k) || 'not placed', xs({ border: kb, font: cageLocation(k) ? {} : { color: { rgb: XC.muted } } }));
+      B.set(rr, 9, [F && F + '♀', M && M + '♂', km.length - F - M && (km.length - F - M) + '?'].filter(Boolean).join(' ') || 'empty', xs({ border: kb }));
+      B.set(rr, 10, [...new Set(km.map(x => fmtDate(x.dob)).filter(Boolean))].join(', '), xs({ border: kb }));
+      B.set(rr, 11, [...new Set(km.map(x => x.strain).filter(Boolean))].join(', '), xs({ border: kb }));
+      B.set(rr, 12, from ? `from #${from.name} (${from.status !== 'Active' ? 'closed' : from.purpose})` : note ? `card WFBR ${norm(note[1])}` : '', xs({ border: kb, font: { color: { rgb: XC.muted } } }));
+    });
+    r += un.length + 2;
+  }
   return B.sheet([4, 30, 11, 7, 8, 44, 3, 10, 22, 9, 12, 28, 11]);
 }
 
@@ -3787,6 +3846,12 @@ const ACTIONS = {
     const mice = animalRows(true).map(r => ({ ...r, 'Weaned from (WFBR)': (() => { const m = DB.mice.find(x => x.name === r['Animal Name']); return m?.wfbr ? cageOf(m.wfbr)?.name || '' : ''; })() }));
     const log = DB.log.map(e => ({ When: new Date(e.ts).toLocaleString(), Change: e.msg, Details: e.details }));
     xlsxDownload(`colony-${todayISO()}.xlsx`, { Cages: { rows: cages, cols: Object.keys(cages[0] || { Cage: 1 }) }, Mice: { rows: mice, cols: [...MLIMS_COLS, ...EXTRA_COLS, 'Weaned from (WFBR)'] }, Litters: { rows: litterRows(), cols: LITTER_COLS }, 'Change log': { rows: log, cols: ['When', 'Change', 'Details'] } });
+  },
+  'link-wfbr': () => {
+    const L = wfbrFromNotes(); if (!L.length) return;
+    const body = `<p>These cages have a WFBR number from their card in the notes. Each will be linked to the breeder cage shown. Nothing else changes, and you can change a link later on the cage page.</p>
+      <div class="tablewrap" style="max-height:55vh"><table class="t"><tr><th>Cage</th><th>Card WFBR</th><th>Link to breeder</th></tr>${L.map(x => `<tr><td><b>${esc(x.c.name)}</b></td><td>${esc(x.ref)}</td><td>${esc(x.b.name)}${x.b.purpose !== 'Breeding' ? ` <span class="badge b-warn">${esc(x.b.purpose)}, not a breeding cage</span>` : ''}${x.b.status !== 'Active' ? ' <span class="badge">closed</span>' : ''}</td></tr>`).join('')}</table></div>`;
+    modal({ title: `Link ${L.length} cages to their breeders`, body, wide: true, okText: `Link ${L.length} cages`, ok: () => { mutate(`Linked ${L.length} cages to their breeders (WFBR from card notes)`, () => { for (const x of L) { const c = DB.cages.find(z => z.id === x.c.id); if (!c.wfbr?.cageId) c.wfbr = { cageId: x.b.id, litterId: '' }; } }, L.map(x => `${x.c.name} → ${x.b.name}`).join('; ')); return true; } });
   },
   'exp-report': () => { try { exportReport(); } catch (e) { console.error(e); alert('Could not make the report: ' + e.message); } },
   'export-log': () => download(`colony-log-${todayISO()}.csv`, '﻿' + toCSV(DB.log.map(e => ({ When: new Date(e.ts).toLocaleString(), Change: e.msg, Details: e.details })), ['When', 'Change', 'Details']), 'text/csv'),
